@@ -1,0 +1,341 @@
+#!/bin/bash
+
+# CEL-seq2 Pipeline: Map Reads and Count UMIs
+# This script maps reads to the genome and performs UMI-aware counting
+
+echo "=== CEL-seq2 Mapping and UMI Counting ==="
+echo "========================================"
+echo ""
+
+# Check command line arguments
+if [ $# -lt 1 ]; then
+    echo "Usage: $0 <demultiplexed_dir> [output_dir]"
+    echo ""
+    echo "Example:"
+    echo "  $0 demultiplexed/ results/"
+    echo ""
+    echo "This will process all *_R1.fastq.gz/*_R2.fastq.gz pairs in the input directory"
+    exit 1
+fi
+
+INPUT_DIR="$1"
+OUTPUT_DIR="${2:-celseq2_results}"
+
+# Check if input directory exists
+if [ ! -d "$INPUT_DIR" ]; then
+    echo "❌ Error: Input directory not found: $INPUT_DIR"
+    exit 1
+fi
+
+# Check for required tools
+for tool in subread-align featureCounts samtools; do
+    if ! command -v $tool &> /dev/null; then
+        echo "❌ Error: $tool not found. Please run 01_install_dependencies.sh"
+        exit 1
+    fi
+done
+
+# Find umi_tools (WSL/mac/Linux friendly) and report version
+find_umi_tools() {
+  if command -v umi_tools >/dev/null 2>&1; then
+    echo "umi_tools"; return 0
+  fi
+  # common pip --user location on linux/WSL
+  if [ -x "$HOME/.local/bin/umi_tools" ]; then
+    echo "$HOME/.local/bin/umi_tools"; return 0
+  fi
+  # macOS pip --user fallback
+  if [ -x "$HOME/Library/Python/3.12/bin/umi_tools" ]; then
+    echo "$HOME/Library/Python/3.12/bin/umi_tools"; return 0
+  fi
+  return 1
+}
+UMI_TOOLS="$(find_umi_tools)" || { echo "❌ Error: umi_tools not found in PATH or user bin"; exit 1; }
+UMI_VER="$($UMI_TOOLS --version 2>/dev/null || echo "unknown")"
+echo "🧪 Using umi_tools: $UMI_TOOLS (version: $UMI_VER)"
+
+# Get script directory
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+# Set up paths - check both in script dir and parent dir
+if [ -d "$SCRIPT_DIR/genome_files" ]; then
+    GENOME_DIR="$SCRIPT_DIR/genome_files"
+elif [ -d "$SCRIPT_DIR/../genome_files" ]; then
+    GENOME_DIR="$SCRIPT_DIR/../genome_files"
+else
+    echo "❌ Error: genome_files directory not found"
+    echo "   Expected at: $SCRIPT_DIR/genome_files or $SCRIPT_DIR/../genome_files"
+    exit 1
+fi
+
+INDEX_PREFIX="$GENOME_DIR/c_elegans_index"
+GTF_FILE="$GENOME_DIR/Caenorhabditis_elegans.WBcel235.104.gtf"
+
+# Check if genome files exist
+if [ ! -f "${INDEX_PREFIX}.00.b.array" ]; then
+    echo "❌ Error: Genome index not found at $INDEX_PREFIX"
+    echo "   Please run 02_build_genome_index.sh from the pipeline directory"
+    exit 1
+fi
+
+if [ ! -f "$GTF_FILE" ]; then
+    echo "❌ Error: GTF file not found at $GTF_FILE"
+    exit 1
+fi
+
+# Create output directories
+mkdir -p "$OUTPUT_DIR"/{bam,counts,logs,final_counts}
+
+# Count samples to process
+SAMPLE_COUNT=$(ls "$INPUT_DIR"/*_R1.fastq.gz 2>/dev/null | grep -v unmatched | wc -l)
+if [ $SAMPLE_COUNT -eq 0 ]; then
+    echo "❌ Error: No demultiplexed samples found in $INPUT_DIR"
+    exit 1
+fi
+
+echo "📊 Found $SAMPLE_COUNT samples to process"
+echo ""
+
+# Function to process a single sample
+process_sample() {
+    local r1_file=$1
+    local r2_file=$2
+    local sample_name=$3
+    
+    echo "📊 Processing: $sample_name"
+    
+    # Step 1: Map reads with Subread [[memory:5876572]]
+    # Map R2 (contains transcript sequences) and preserve UMI info from R1
+    echo "   🗺️  Mapping reads..."
+    subread-align -t 0 -T 4 -i "$INDEX_PREFIX" \
+        -r "$r2_file" \
+        -o "$OUTPUT_DIR/bam/${sample_name}.bam" \
+        --sortReadsByCoordinates \
+        2>&1 | tee "$OUTPUT_DIR/logs/${sample_name}_mapping.log" | \
+        grep -E "Total reads|Mapped reads" || true
+    
+    # Step 2: Index BAM
+    if [ -f "$OUTPUT_DIR/bam/${sample_name}.bam" ]; then
+        samtools index "$OUTPUT_DIR/bam/${sample_name}.bam"
+    else
+        echo "   ❌ Error: Mapping failed for $sample_name"
+        return 1
+    fi
+    
+    # Step 3: Assign reads to genes
+    echo "   🧬 Assigning reads to genes..."
+    featureCounts -a "$GTF_FILE" \
+        -o "$OUTPUT_DIR/counts/${sample_name}_assigned.txt" \
+        -R BAM \
+        -t exon \
+        -g gene_id \
+        -s 1 \
+        -T 4 \
+        "$OUTPUT_DIR/bam/${sample_name}.bam" \
+        2>&1 | tee "$OUTPUT_DIR/logs/${sample_name}_assignment.log" | \
+        grep -E "Successfully assigned" || true
+    
+    # The -R BAM option creates a new BAM with feature assignments
+    # featureCounts puts it in the output directory (counts)
+    if [ -f "$OUTPUT_DIR/counts/${sample_name}.bam.featureCounts.bam" ]; then
+        mv "$OUTPUT_DIR/counts/${sample_name}.bam.featureCounts.bam" "$OUTPUT_DIR/bam/${sample_name}_assigned.bam"
+
+# Always coordinate-sort before indexing (some -R BAM outputs aren’t sorted)
+samtools sort -@ 4 \
+  -o "$OUTPUT_DIR/bam/${sample_name}_assigned.csorted.bam" \
+  "$OUTPUT_DIR/bam/${sample_name}_assigned.bam"
+mv "$OUTPUT_DIR/bam/${sample_name}_assigned.csorted.bam" \
+   "$OUTPUT_DIR/bam/${sample_name}_assigned.bam"
+samtools index "$OUTPUT_DIR/bam/${sample_name}_assigned.bam"
+    elif [ -f "$OUTPUT_DIR/bam/${sample_name}.bam.featureCounts.bam" ]; then
+        mv "$OUTPUT_DIR/counts/${sample_name}.bam.featureCounts.bam" "$OUTPUT_DIR/bam/${sample_name}_assigned.bam"
+
+# Always coordinate-sort before indexing (some -R BAM outputs aren’t sorted)
+samtools sort -@ 4 \
+  -o "$OUTPUT_DIR/bam/${sample_name}_assigned.csorted.bam" \
+  "$OUTPUT_DIR/bam/${sample_name}_assigned.bam"
+mv "$OUTPUT_DIR/bam/${sample_name}_assigned.csorted.bam" \
+   "$OUTPUT_DIR/bam/${sample_name}_assigned.bam"
+samtools index "$OUTPUT_DIR/bam/${sample_name}_assigned.bam"
+    elif [ -f "${sample_name}.bam.featureCounts.bam" ]; then
+        mv "$OUTPUT_DIR/counts/${sample_name}.bam.featureCounts.bam" "$OUTPUT_DIR/bam/${sample_name}_assigned.bam"
+
+# Always coordinate-sort before indexing (some -R BAM outputs aren’t sorted)
+samtools sort -@ 4 \
+  -o "$OUTPUT_DIR/bam/${sample_name}_assigned.csorted.bam" \
+  "$OUTPUT_DIR/bam/${sample_name}_assigned.bam"
+mv "$OUTPUT_DIR/bam/${sample_name}_assigned.csorted.bam" \
+   "$OUTPUT_DIR/bam/${sample_name}_assigned.bam"
+samtools index "$OUTPUT_DIR/bam/${sample_name}_assigned.bam"
+    else
+        echo "   ❌ Error: Could not find featureCounts output BAM"
+        echo "   Checked: $OUTPUT_DIR/counts/${sample_name}.bam.featureCounts.bam"
+        echo "   Checked: $OUTPUT_DIR/bam/${sample_name}.bam.featureCounts.bam"
+        echo "   Checked: ${sample_name}.bam.featureCounts.bam"
+        return 1
+    fi
+    
+    # Step 4: Deduplicate based on UMIs
+    echo "   🔍 Deduplicating by UMI..."
+    # Determine supported umi_tools dedup flags dynamically (handles older versions like 0.2.x)
+    DEDUP_HELP="$($UMI_TOOLS dedup --help 2>&1 || true)"
+    EXTRACT_ARG=""
+    if echo "$DEDUP_HELP" | grep -q -- "--extract-umi-method"; then
+        EXTRACT_ARG="--extract-umi-method=read_id --umi-separator=_"
+    else
+        echo "⚠️  This umi_tools lacks --extract-umi-method; ensure UMIs are present in RX tag or upgrade umi_tools."
+    fi
+
+    # Auto-detect gene tag added by featureCounts -R BAM (XT vs XF)
+    GENE_TAG="XT"
+    if samtools view -@ 1 "$OUTPUT_DIR/bam/${sample_name}_assigned.bam" 2>/dev/null | head -n1 | grep -q "XF:Z:"; then
+        GENE_TAG="XF"
+    fi
+
+    PER_GENE_ARGS=""
+    if echo "$DEDUP_HELP" | grep -q -- "--per-gene"; then
+        PER_GENE_ARGS="--per-gene --gene-tag=${GENE_TAG}"
+    else
+        echo "⚠️  umi_tools dedup lacks --per-gene. Will deduplicate by position only (less accurate for gene-level UMIs)."
+    fi
+
+    if [ -f "$OUTPUT_DIR/bam/${sample_name}_assigned.bam" ]; then
+        $UMI_TOOLS dedup \
+            -I "$OUTPUT_DIR/bam/${sample_name}_assigned.bam" \
+            -S "$OUTPUT_DIR/bam/${sample_name}_dedup.bam" \
+            --output-stats="$OUTPUT_DIR/logs/${sample_name}_dedup" \
+            $EXTRACT_ARG \
+
+            $PER_GENE_ARGS \
+
+            --log="$OUTPUT_DIR/logs/${sample_name}_dedup.log" \
+            2>&1 | grep -E "Input Reads:|Number of reads out:" || true
+        
+        # Check if dedup was successful
+        if [ ! -f "$OUTPUT_DIR/bam/${sample_name}_dedup.bam" ] || [ ! -s "$OUTPUT_DIR/bam/${sample_name}_dedup.bam" ]; then
+            echo "   ⚠️  Warning: Deduplication may have failed - check log file"
+        fi
+    else
+        echo "   ❌ Error: Assigned BAM not found for deduplication"
+        return 1
+    fi
+    
+    # Step 5: Count deduplicated reads (UMI counts)
+    echo "   📈 Generating UMI counts..."
+    if [ -f "$OUTPUT_DIR/bam/${sample_name}_dedup.bam" ] && [ -s "$OUTPUT_DIR/bam/${sample_name}_dedup.bam" ]; then
+        featureCounts -a "$GTF_FILE" \
+            -o "$OUTPUT_DIR/final_counts/${sample_name}_umi_counts.txt" \
+            -t exon \
+            -g gene_id \
+            -s 1 \
+            -T 4 \
+            "$OUTPUT_DIR/bam/${sample_name}_dedup.bam" \
+            2>&1 | tee "$OUTPUT_DIR/logs/${sample_name}_umi_counts.log" | \
+            grep -E "Successfully assigned" || true
+    else
+        echo "   ⚠️  Skipping UMI counting due to empty/missing dedup BAM"
+    fi
+    
+    echo "   ✅ Done with $sample_name"
+    echo ""
+}
+
+# Process all samples
+COUNTER=0
+for r1_file in "$INPUT_DIR"/*_R1.fastq.gz; do
+    # Skip unmatched reads
+    if [[ "$r1_file" == *"unmatched"* ]]; then
+        continue
+    fi
+    
+    # Get corresponding R2 file
+    r2_file="${r1_file%_R1.fastq.gz}_R2.fastq.gz"
+    sample_name=$(basename "$r1_file" _R1.fastq.gz)
+    
+    # Check if R2 exists
+    if [ ! -f "$r2_file" ]; then
+        echo "⚠️  Warning: R2 file not found for $sample_name, skipping..."
+        continue
+    fi
+    
+    COUNTER=$((COUNTER + 1))
+    echo "[$COUNTER/$SAMPLE_COUNT]"
+    process_sample "$r1_file" "$r2_file" "$sample_name"
+done
+
+# Create combined count matrix
+echo "📊 Creating combined UMI count matrix..."
+python3 << EOF
+import pandas as pd
+import glob
+import os
+
+# Get all UMI count files
+count_files = glob.glob("$OUTPUT_DIR/final_counts/*_umi_counts.txt")
+print(f"Found {len(count_files)} count files")
+
+if len(count_files) > 0:
+    # Read and combine counts
+    all_counts = {}
+    
+    for cf in count_files:
+        sample_name = os.path.basename(cf).replace("_umi_counts.txt", "")
+        try:
+            # Read featureCounts output
+            df = pd.read_csv(cf, sep='\t', comment='#')
+            # The count is in the last column
+            counts = df.set_index('Geneid')[df.columns[-1]].to_dict()
+            all_counts[sample_name] = counts
+        except Exception as e:
+            print(f"Failed to read {sample_name}: {e}")
+    
+    if all_counts:
+        # Create count matrix
+        count_matrix = pd.DataFrame(all_counts).fillna(0).astype(int)
+        count_matrix.index.name = 'Gene'
+        
+        # Save matrix
+        count_matrix.to_csv("$OUTPUT_DIR/umi_count_matrix.csv")
+        print(f"✅ Saved UMI count matrix: {count_matrix.shape[0]} genes x {count_matrix.shape[1]} samples")
+        
+        # Create sample statistics
+        sample_stats = pd.DataFrame({
+            'Sample': count_matrix.columns,
+            'Total_Genes_Detected': (count_matrix > 0).sum().values,
+            'Total_UMI_Counts': count_matrix.sum().values,
+            'Mean_UMIs_per_Gene': count_matrix.replace(0, pd.NA).mean().round(1).values
+        })
+        sample_stats = sample_stats.sort_values('Total_UMI_Counts', ascending=False)
+        sample_stats.to_csv("$OUTPUT_DIR/sample_statistics.csv", index=False)
+        
+        print(f"\n📊 Sample Summary:")
+        print(sample_stats.to_string(index=False))
+        
+        # Create gene statistics
+        gene_stats = pd.DataFrame({
+            'Gene': count_matrix.index,
+            'Total_UMI_Count': count_matrix.sum(axis=1).values,
+            'Samples_Detected_In': (count_matrix > 0).sum(axis=1).values,
+            'Mean_UMIs_per_Sample': count_matrix.replace(0, pd.NA).mean(axis=1).round(1).values
+        })
+        gene_stats = gene_stats.sort_values('Total_UMI_Count', ascending=False)
+        gene_stats.to_csv("$OUTPUT_DIR/gene_statistics.csv", index=False)
+        
+        print(f"\n🧬 Top 10 Expressed Genes:")
+        print(gene_stats.head(10).to_string(index=False))
+else:
+    print("❌ No count files found to create matrix")
+EOF
+
+echo ""
+echo "✅ Pipeline complete!"
+echo ""
+echo "📁 Results in: $OUTPUT_DIR/"
+echo "   - UMI count matrix: $OUTPUT_DIR/umi_count_matrix.csv"
+echo "   - Sample stats: $OUTPUT_DIR/sample_statistics.csv"
+echo "   - Gene stats: $OUTPUT_DIR/gene_statistics.csv"
+echo "   - BAM files: $OUTPUT_DIR/bam/"
+echo "   - Count files: $OUTPUT_DIR/final_counts/"
+echo "   - Logs: $OUTPUT_DIR/logs/"
+echo ""
+echo "⚠️  Check log files for any samples with deduplication issues"
